@@ -2,20 +2,20 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# Load the image and resize it to 512x512 
+# YOLO expects a consistent frame size for pose detection.
 image_path = 'test_person.jpg'
 img = cv2.imread(image_path)
 img = cv2.resize(img, (512, 512))
 
-# Run YOLO to get the keypoints
+# Get the detected body joints.
 model = YOLO('yolov8n-pose.pt')
 results = model(img)
-keypoints = results[0].keypoints.xy[0].cpu().numpy() # Get the X,Y coordinates
+keypoints = results[0].keypoints.xy[0].cpu().numpy()
 
-# Create a black canvas
+# Draw the pose on a blank image.
 canvas = np.zeros((512, 512, 3), dtype=np.uint8)
 
-# Define how the joints connect
+# Each pair marks two joints to connect.
 skeleton_pairs = [
     (0, 1), (0, 2), (1, 3), (2, 4),       # Face
     (5, 6),                               # Shoulders
@@ -27,21 +27,19 @@ skeleton_pairs = [
     (12, 14), (14, 16)                    # Right leg
 ]
 
-# Draw the lines (limbs)
 for pair in skeleton_pairs:
     pt1 = (int(keypoints[pair[0]][0]), int(keypoints[pair[0]][1]))
     pt2 = (int(keypoints[pair[1]][0]), int(keypoints[pair[1]][1]))
     
-    # Ignore lines if the joint goes off screen (0,0) or has low confidence
+    # YOLO uses (0, 0) for joints it couldn't locate.
     if pt1 != (0, 0) and pt2 != (0, 0):
-        cv2.line(canvas, pt1, pt2, (255, 255, 255), 3) # Draw white line
+        cv2.line(canvas, pt1, pt2, (255, 255, 255), 3)
 
-# Draw the joints (dots)
 for i, pt in enumerate(keypoints):
     x, y = int(pt[0]), int(pt[1])
     if x != 0 and y != 0:
-        cv2.circle(canvas, (x, y), 4, (0, 255, 0), -1) # Draw green dot
+        cv2.circle(canvas, (x, y), 4, (0, 255, 0), -1)
 
-# Save the result
+# Save the pose image for the diffusion script.
 cv2.imwrite('skeleton_output.jpg', canvas)
 print("Skeleton saved as skeleton_output.jpg! Open it to check.")
