@@ -3,109 +3,148 @@ import numpy as np
 import torch
 import threading
 import queue
-from ultralytics import YOLO
-from PIL import Image
-from diffusers import StableDiffusionControlNetPipeline, ControlNetModel, LCMScheduler
+import traceback
+import time
+import os
 
-# Load the image generation pipeline and pose detector before opening the webcam.
-print("Loading models... (Grab a coffee, this takes a sec)")
-controlnet = ControlNetModel.from_pretrained("lllyasviel/control_v11p_sd15_openpose", torch_dtype=torch.float16)
-pipe = StableDiffusionControlNetPipeline.from_pretrained(
-    "runwayml/stable-diffusion-v1-5", controlnet=controlnet, safety_checker=None, torch_dtype=torch.float16
+from PIL import Image
+from ultralytics import YOLO
+from diffusers import (
+    StableDiffusionControlNetPipeline,
+    ControlNetModel,
+    LCMScheduler
 )
-pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
-pipe.load_lora_weights("latent-consistency/lcm-lora-sdv1-5")
+
+SIZE = 512
+CAMERA_INDEX = 0
+SEED = 12345
+
+# 384 uses less VRAM 512 gives a larger output.
+GENERATION_SIZE = 512
+
+# Keep model weights in RAM and move them to the GPU as needed.
+USE_CPU_OFFLOAD = True
+
+# Optional reference image for a consistent character.
+USE_REFERENCE_IMAGE = False
+REFERENCE_IMAGE_PATH = "character.png"
+
+PROMPT = (
+    "anime illustration, solo, one young adult man, "
+    "full body, short hair, blue hoodie, blue jeans, "
+    "consistent character design, clean anime line art, "
+    "simple white background, detailed face"
+)
+
+NEGATIVE_PROMPT = (
+    "female, girl, woman, multiple people, duplicate limbs, extra fingers, "
+    "deformed anatomy, blurry, low quality, "
+    "complex background, cropped body"
+)
+
+# Model loading requires a CUDA enabled GPU.
+if not torch.cuda.is_available():
+    raise RuntimeError(
+        "CUDA unavailable. Install CUDA-enabled PyTorch."
+    )
+
+DEVICE = "cuda"
+DTYPE = torch.float16
+
+properties = torch.cuda.get_device_properties(0)
+vram_gb = properties.total_memory / (1024 ** 3)
+
+print("=" * 50)
+print("GPU:", torch.cuda.get_device_name(0))
+print(f"VRAM: {vram_gb:.2f} GB")
+print("=" * 50)
+
+print("Loading ControlNet...")
+
+controlnet = ControlNetModel.from_pretrained(
+    "lllyasviel/control_v11p_sd15_openpose",
+    torch_dtype=DTYPE
+)
+
+print("Loading Stable Diffusion...")
+
+pipe = StableDiffusionControlNetPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5",
+    controlnet=controlnet,
+    torch_dtype=DTYPE,
+    safety_checker=None
+)
+
+# Use LCM for four step image generation.
+pipe.scheduler = LCMScheduler.from_config(
+    pipe.scheduler.config
+)
+
+pipe.load_lora_weights(
+    "latent-consistency/lcm-lora-sdv1-5"
+)
+
 pipe.fuse_lora()
+
+reference_image = None
+
+if USE_REFERENCE_IMAGE:
+
+    if not os.path.isfile(REFERENCE_IMAGE_PATH):
+        raise FileNotFoundError(
+            f"Reference image missing: {REFERENCE_IMAGE_PATH}"
+        )
+
+    reference_image = Image.open(
+        REFERENCE_IMAGE_PATH
+    ).convert("RGB")
+
+    pipe.load_ip_adapter(
+        "h94/IP-Adapter",
+        subfolder="models",
+        weight_name="ip-adapter_sd15.bin"
+    )
+
+    pipe.set_ip_adapter_scale(0.5)
+
+# Enable memory saving options supported by this diffusers version.
 if hasattr(pipe, "enable_vae_slicing"):
     pipe.enable_vae_slicing()
-else:
+elif hasattr(pipe.vae, "enable_slicing"):
     pipe.vae.enable_slicing()
-# Run image generation on the NVIDIA GPU.
-pipe.to("cuda")
 
-yolo_model = YOLO('yolov8n-pose.pt')
-print("Models loaded! Starting webcam...")
+if hasattr(pipe, "enable_attention_slicing"):
+    pipe.enable_attention_slicing()
 
-# Keep only the newest pose and generated image so slow inference cannot build a backlog.
-pose_queue = queue.Queue(maxsize=1)  
-output_queue = queue.Queue(maxsize=1) 
+# Offload model weights to CPU between GPU operations.
+if USE_CPU_OFFLOAD:
+    pipe.enable_model_cpu_offload()
+else:
+    pipe.to(DEVICE)
 
-# COCO pose keypoint pairs used to draw the detected person's skeleton.
-skeleton_pairs = [
-    (0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7), (7, 9), 
-    (6, 8), (8, 10), (5, 11), (6, 12), (11, 12), (11, 13), 
-    (13, 15), (12, 14), (14, 16)
-]
+print("Loading YOLO...")
 
-def draw_skeleton(keypoints):
-    # Convert the detected keypoints into the 512x512 ControlNet input image.
-    canvas = np.zeros((512, 512, 3), dtype=np.uint8)
-    for pair in skeleton_pairs:
-        pt1 = (int(keypoints[pair[0]][0]), int(keypoints[pair[0]][1]))
-        pt2 = (int(keypoints[pair[1]][0]), int(keypoints[pair[1]][1]))
-        if pt1 != (0, 0) and pt2 != (0, 0):
-            cv2.line(canvas, pt1, pt2, (255, 255, 255), 3)
-    for pt in keypoints:
-        x, y = int(pt[0]), int(pt[1])
-        if x != 0 and y != 0:
-            cv2.circle(canvas, (x, y), 4, (0, 255, 0), -1)
-    return canvas
+yolo = YOLO("yolov8n-pose.pt")
 
-# Generate images on a worker thread so the webcam preview stays responsive.
-def diffusion_worker():
-    while True:
-        # Wait for a new skeleton to arrive
-        skeleton_img = pose_queue.get() 
-        pil_img = Image.fromarray(cv2.cvtColor(skeleton_img, cv2.COLOR_BGR2RGB))
-        
-        # Generate the character
-        result = pipe(
-            prompt="masterpiece, best quality, anime character wearing a cyberpunk jacket, neon lighting",
-            image=pil_img,
-            num_inference_steps=4,
-            guidance_scale=1.0,
-        ).images[0]
-        
-        # Drop a stale result if needed, then publish the newest generated image.
-        try: output_queue.get_nowait()
-        except queue.Empty: pass
-        output_queue.put(np.array(result))
+print("Models loaded.")
 
-# Start image generation independently from webcam capture and display.
-threading.Thread(target=diffusion_worker, daemon=True).start()
+# Keep only the latest frame in each queue.
+pose_queue = queue.Queue(maxsize=1)
+output_queue = queue.Queue(maxsize=1)
 
-# Capture webcam frames, detect a pose, and display the latest results.
-cap = cv2.VideoCapture(0)
+stop_event = threading.Event()
 
-while True:
-    ret, frame = cap.read()
-    if not ret: break
-    
-    # Resize to match the AI's expected input size
-    frame_resized = cv2.resize(frame, (512, 512))
-    results = yolo_model(frame_resized, verbose=False)
-    
-    # If YOLO finds a person
-    if len(results[0].keypoints.xy) > 0:
-        keypoints = results[0].keypoints.xy[0].cpu().numpy()
-        skeleton = draw_skeleton(keypoints)
-        
-        # Push the newest skeleton to the AI thread
-        try: pose_queue.get_nowait()
-        except queue.Empty: pass
-        pose_queue.put(skeleton)
-        
-        # Show the stick figure
-        cv2.imshow("Live Pose", skeleton)
-    
-    # If the AI has finished a new frame, show it
-    if not output_queue.empty():
-        ai_image = output_queue.get()
-        cv2.imshow("AI Vtuber", cv2.cvtColor(ai_image, cv2.COLOR_RGB2BGR))
+def put_latest(q, item):
+    # Replace an older queued item with the latest one.
+    try:
+        q.put_nowait(item)
+    except queue.Full:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            pass
 
-    # Press 'q' to quit
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            pass
