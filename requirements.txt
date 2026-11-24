@@ -1,0 +1,11 @@
+torch
+torchvision
+torchaudio
+diffusers
+transformers
+accelerate
+peft
+ultralytics
+opencv-python
+pillow
+simple code to install the required packages using pip: python -m pip install --upgrade pip; if ($?) { python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126 }; if ($?) { python -m pip install --upgrade opencv-python numpy Pillow ultralytics diffusers transformers accelerate safetensors peft huggingface-hub }
